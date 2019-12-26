@@ -7,6 +7,7 @@ from pytz import timezone
 import torch
 import torch.nn as nn
 import numpy as np
+import nltk
 from torch.utils.data import Dataset, DataLoader
 from torch.autograd import Variable
 
@@ -14,13 +15,11 @@ from torch.autograd import Variable
 from flair.embeddings import WordEmbeddings, FlairEmbeddings, DocumentPoolEmbeddings, Sentence
 
 # initialize the word embeddings
-glove_embedding = WordEmbeddings('glove')
 flair_embedding_forward = FlairEmbeddings('news-forward')
 flair_embedding_backward = FlairEmbeddings('news-backward')
 
 # initialize the document embeddings, mode = mean
-document_embeddings = DocumentPoolEmbeddings([glove_embedding,
-                                              flair_embedding_backward,
+document_embeddings = DocumentPoolEmbeddings([flair_embedding_backward,
                                               flair_embedding_forward])
 
 # Hyper Parameters
@@ -66,13 +65,13 @@ class Flatten(nn.Module):
 
 class SiameseNetwork(nn.Module):
 
-    def __init__(self, contra_loss=False):
+    def __init__(self, contra_loss=False, input_dim=4096):
         super(SiameseNetwork, self).__init__()
 
         self.contra_loss = contra_loss
 
         self.fc1 = nn.Sequential(
-            nn.Linear(4196, 1024),
+            nn.Linear(input_dim, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.5),
             nn.Linear(1024, 128),
@@ -134,8 +133,29 @@ def cur_time():
     loc_dt = datetime.now(eastern)
     return loc_dt.strftime(fmt).replace(' ', '_')
 
+def val_loss(model, optimizer, criterion, dev_loader):
+    with torch.no_grad():
+        val_losses = []
+        for i, (vec1, vec2, labels) in enumerate(dev_loader):
+            vec1 = vec1.cuda()
+            vec2 = vec2.cuda()
+            labels = labels.cuda()
 
-def train(num_epochs, x1_train, x2_train, y_train, x1_dev, x2_dev, y_dev):
+            vec1 = Variable(vec1)
+            vec2 = Variable(vec2)
+            labels = Variable(labels.view(-1, 1).float())
+
+            # Forward + Backward + Optimize
+            output_labels_prob = model(vec1, vec2)
+            loss = criterion(output_labels_prob, labels)
+            val_losses.append(loss.item())
+
+        avg_loss = sum(val_losses)/len(val_losses)
+
+        return avg_loss
+    
+
+def train(num_epochs, input_dim, lr, x1_train, x2_train, y_train, x1_dev, x2_dev, y_dev):
     
     train_dataset = LFWDataset(x1_train, x2_train, y_train)
     print("Loaded {} training data.".format(len(train_dataset)))
@@ -151,15 +171,19 @@ def train(num_epochs, x1_train, x2_train, y_train, x1_dev, x2_dev, y_dev):
                                                batch_size=BATCH_SIZE,
                                                shuffle=True)
 
-    siamese_net = SiameseNetwork(False)
+    siamese_net = SiameseNetwork(False, input_dim)
     siamese_net = siamese_net.cuda()
     criterion = nn.BCELoss()
 
-    optimizer = torch.optim.Adam(siamese_net.parameters())
-
+    optimizer = torch.optim.Adam(siamese_net.parameters(), lr=lr)
+    
+    val_losses = []
+    train_losses = []
+    
     # Train the Model
     for epoch in range(num_epochs):
         siamese_net.train()
+        cur_loss = []
         for i, (vec1, vec2, labels) in enumerate(train_loader):
             vec1 = vec1.cuda()
             vec2 = vec2.cuda()
@@ -175,8 +199,17 @@ def train(num_epochs, x1_train, x2_train, y_train, x1_dev, x2_dev, y_dev):
             loss = criterion(output_labels_prob, labels)
             loss.backward()
             optimizer.step()
-        print('Epoch [%d/%d], Iter [%d/%d] Loss: %.4f' % (epoch+1, num_epochs, i+1, len(train_dataset)//BATCH_SIZE, loss.item()))
+            cur_loss.append(loss.item())
             
+        avg_train_loss = sum(cur_loss)/len(cur_loss)
+        avg_val_loss = val_loss(siamese_net, optimizer, criterion, dev_loader)
+        
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+            
+        
+        print('Epoch [%d/%d], Iter [%d/%d] Train Loss: %.4f, Val Loss: %.4f' % (epoch+1, num_epochs, i+1, len(train_dataset)//BATCH_SIZE, avg_train_loss, avg_val_loss))
+        
         test_against_data('training', train_loader, siamese_net)
         test_against_data('development', dev_loader, siamese_net)
 
@@ -189,7 +222,7 @@ def train(num_epochs, x1_train, x2_train, y_train, x1_dev, x2_dev, y_dev):
     #model_file_name = "{}_{}".format(cur_time(), args.model_file)
     #torch.save(siamese_net.state_dict(), model_file_name)
     #print("Saved model at {}".format(model_file_name))
-    return siamese_net
+    return siamese_net, train_losses, val_losses
 
 
 def test_against_data(label, dataset, siamese_net):
@@ -230,9 +263,16 @@ def chunks(l, n):
         yield l[i:i + n]
 
 def process_df(xdf, ydf=None, passing_y=False):
+    args1 = [' '.join(nltk.sent_tokenize(x)[0:5]) for x in xdf['argument1'].tolist()]
+    args1 = [x[0:500] for x in args1]
+    args2 = [' '.join(nltk.sent_tokenize(x)[0:5]) for x in xdf['argument2'].tolist()]
+    args2 = [x[0:500] for x in args2]
+    ys     = ydf['is_same_side'].tolist()
+    
+    
     
     x1_out = []
-    for c in chunks(xdf['argument1'].tolist(), 5):
+    for c in chunks(args1, 2):
         sents  = [Sentence(x, use_tokenizer=True) for x in c]
         document_embeddings.embed(sents)
         for sent in sents:
@@ -241,7 +281,7 @@ def process_df(xdf, ydf=None, passing_y=False):
         del sents
 
     x2_out = []
-    for c in chunks(xdf['argument2'].tolist(), 5):
+    for c in chunks(args2, 2):
         sents  = [Sentence(x, use_tokenizer=True) for x in c]
         document_embeddings.embed(sents)
         for sent in sents:
@@ -250,16 +290,16 @@ def process_df(xdf, ydf=None, passing_y=False):
         del sents
 
     if passing_y:
-        y  = [1 if y else 0 for y in ydf['is_same_side'].tolist()]
+        ys = [1 if y else 0 for y in ys]
     else:
-        y = [0] * len(x1_out)
+        ys = [0] * len(x1_out)
 
-    return x1_out, x2_out, y
+    return x1_out, x2_out, ys
 
-def test(model_file, x1, x2, y, siamese_net=None):
+def test(model_file, x1, x2, y, siamese_net=None, input_dim=4096):
     if not siamese_net:
         saved_model = torch.load(model_file)
-        siamese_net = SiameseNetwork(False)
+        siamese_net = SiameseNetwork(False, input_dim)
         siamese_net.load_state_dict(saved_model)
 
     siamese_net = siamese_net.cuda()
