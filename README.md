@@ -39,3 +39,7 @@ We trained a model using lemma 3 grams for argument1 and argument2 on the traini
    
 For more details, visit https://sameside.webis.de
 
+# Same Side Classification via Siamese NN:
+
+
+The code for reproducing our results can be found in the notebook same-side-classification-siamese.ipynb and the siamese.py file.
